@@ -26,6 +26,7 @@ VIDEO_ID_PATTERN = re.compile(r"[A-Za-z0-9_-]{1,64}")
 
 CACHE_TTL_SECONDS = 7 * 24 * 60 * 60  # a swept entry only costs one re-download
 MAX_DOWNLOAD_BYTES = 500_000_000  # refuse to cache a single oversized video
+YOUTUBE_SOCKET_TIMEOUT = 30
 
 
 def sweep_cache(cache_dir: str, ttl_seconds: int = CACHE_TTL_SECONDS) -> None:
@@ -75,6 +76,8 @@ def youtube_stream(stream_url: str) -> Response:
             "outtmpl": cache_path,
             "quiet": True,
             "max_filesize": MAX_DOWNLOAD_BYTES,
+            # yt-dlp otherwise inherits the global socket default of no timeout
+            "socket_timeout": YOUTUBE_SOCKET_TIMEOUT,
         }
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([stream_url])
@@ -131,6 +134,20 @@ def checked_stream_body(
     return chain([first_chunk], body)
 
 
+def closing_body(
+    upstream_response: requests.Response, body: Iterator[bytes]
+) -> Iterator[bytes]:
+    """Relay the body, always releasing the upstream connection.
+
+    A client that hangs up mid-episode abandons this generator and the WSGI
+    server closes it; without the finally the upstream socket is never released.
+    """
+    try:
+        yield from body
+    finally:
+        upstream_response.close()
+
+
 def generic_stream(stream_url: str) -> Response | tuple[str, int]:
     headers = filter_headers(request.headers.items())
     upstream_response = safe_get(
@@ -140,25 +157,34 @@ def generic_stream(stream_url: str) -> Response | tuple[str, int]:
         headers=headers,
         stream=True,
     )
-    upstream_response.raise_for_status()
 
-    if app.ENABLE_STREAMING_SAFETY_CHECK and upstream_response.status_code in (
-        200,
-        206,
-    ):  # Only perform checks on successful responses
-        try:
-            body = checked_stream_body(upstream_response, stream_url)
-        except ValueError as e:
-            logging.error(f"Safety check failed for {stream_url}: {e}")
-            return "Invalid stream file", 403
-    else:
-        body = upstream_response.iter_content(chunk_size=8192)
+    # Any path that does not hand the body to a Response still owns the socket
+    handed_off = False
+    try:
+        upstream_response.raise_for_status()
 
-    return Response(
-        body,
-        status=upstream_response.status_code,
-        headers=filter_response_headers(upstream_response.headers),
-    )
+        if app.ENABLE_STREAMING_SAFETY_CHECK and upstream_response.status_code in (
+            200,
+            206,
+        ):  # Only perform checks on successful responses
+            try:
+                body = checked_stream_body(upstream_response, stream_url)
+            except ValueError as e:
+                logging.error(f"Safety check failed for {stream_url}: {e}")
+                return "Invalid stream file", 403
+        else:
+            body = upstream_response.iter_content(chunk_size=8192)
+
+        response = Response(
+            closing_body(upstream_response, body),
+            status=upstream_response.status_code,
+            headers=filter_response_headers(upstream_response.headers),
+        )
+        handed_off = True
+        return response
+    finally:
+        if not handed_off:
+            upstream_response.close()
 
 
 @bp.route("/<path:encoded_url>")

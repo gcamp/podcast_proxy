@@ -9,6 +9,12 @@ from urllib.parse import urljoin, urlparse
 
 MAX_REDIRECTS = 5
 
+# (connect, read). The read timeout is the gap allowed between chunks rather than
+# a budget for the whole transfer, so a slow episode still downloads while a
+# stalled one raises. Without it requests waits forever and the worker thread is
+# never returned to the pool.
+DEFAULT_TIMEOUT = (10, 30)
+
 # Response headers safe to relay to the client. Notably excludes Set-Cookie (an
 # arbitrary upstream must not set cookies on the proxy's own domain) and
 # Content-Encoding (iter_content has already decompressed the body, so it lies).
@@ -60,6 +66,8 @@ def safe_get(
     (podcast CDNs rely on them heavily) but a permitted host is not allowed to
     bounce us to an internal address.
     """
+    kwargs.setdefault("timeout", DEFAULT_TIMEOUT)
+
     for _ in range(MAX_REDIRECTS):
         check_hostname(url)
         response = session.get(url, allow_redirects=False, **kwargs)

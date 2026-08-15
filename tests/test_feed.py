@@ -1,4 +1,4 @@
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, patch
 from pathlib import Path
 import pytest
 import requests
@@ -11,6 +11,15 @@ from app.feed.routes import (
 )
 
 resources = Path(__file__).parent / "resources"
+
+
+def make_feed_response(chunks):
+    """A stand-in for a streamed requests.Response, context manager included"""
+    response = MagicMock(encoding='utf-8')
+    response.__enter__.return_value = response
+    response.raise_for_status.return_value = None
+    response.iter_content.return_value = iter(chunks)
+    return response
 
 def test_proxy_feed_success(client):
     with patch('app.feed.routes.fetch_rss_feed') as mock_fetch:
@@ -151,9 +160,7 @@ def test_rewrite_youtube_feed_with_no_videos(app):
 
 def test_fetch_rss_feed_rejects_non_xml_content():
     """An HTML error page served where XML was expected must not become a feed"""
-    response = Mock(encoding='utf-8')
-    response.raise_for_status.return_value = None
-    response.iter_content.return_value = iter([b'<html><body>404 Not Found</body></html>'])
+    response = make_feed_response([b'<html><body>404 Not Found</body></html>'])
 
     with patch('app.feed.routes.safe_get', return_value=response):
         assert fetch_rss_feed('https://example.com/rss') is None
@@ -166,14 +173,10 @@ def test_fetch_rss_feed_refuses_oversized_feed():
     the size cap can reject it.
     """
     padding = b'<item><title>' + b'p' * 8000 + b'</title></item>'
-    oversized = iter(
+    response = make_feed_response(
         [b'<?xml version="1.0"?><rss version="2.0"><channel><title>x</title>']
         + [padding] * 1500  # ~12MB, comfortably over the 10MB cap
     )
-
-    response = Mock(encoding='utf-8')
-    response.raise_for_status.return_value = None
-    response.iter_content.return_value = oversized
 
     with patch('app.feed.routes.safe_get', return_value=response):
         assert fetch_rss_feed('https://example.com/rss') is None

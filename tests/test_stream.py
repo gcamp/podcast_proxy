@@ -296,3 +296,64 @@ def test_proxy_media_blocks_internal_targets(client, url):
 
     mock_get.assert_not_called()
     assert response.status_code == 500
+
+
+def consume(response):
+    """Drain a streamed Response the way a WSGI server would"""
+    return b"".join(response.response)
+
+
+def test_generic_stream_closes_upstream_when_body_is_consumed(app):
+    """The socket must go back to the pool once the episode has been relayed"""
+    upstream = upstream_with({"Content-Type": "audio/mpeg"})
+
+    with app.test_request_context():
+        with patch("app.stream.routes.safe_get", return_value=upstream):
+            response = generic_stream("https://cdn.example.com/ep1.mp3")
+
+        assert consume(response) == b"audio bytes"
+
+    upstream.close.assert_called_once()
+
+
+def test_generic_stream_closes_upstream_when_client_hangs_up(app):
+    """Abandoning the body mid-episode is the common case, and it leaked sockets"""
+    upstream = upstream_with({"Content-Type": "audio/mpeg"})
+
+    with app.test_request_context():
+        with patch("app.stream.routes.safe_get", return_value=upstream):
+            response = generic_stream("https://cdn.example.com/ep1.mp3")
+
+        body = iter(response.response)
+        next(body)  # client reads one chunk, then goes away
+        response.response.close()
+
+    upstream.close.assert_called_once()
+
+
+def test_generic_stream_closes_upstream_on_error_status(app):
+    """raise_for_status aborts before a Response exists to own the socket"""
+    upstream = upstream_with({"Content-Type": "text/html"})
+    upstream.raise_for_status.side_effect = requests.HTTPError("404")
+
+    with app.test_request_context():
+        with patch("app.stream.routes.safe_get", return_value=upstream):
+            with pytest.raises(requests.HTTPError):
+                generic_stream("https://cdn.example.com/ep1.mp3")
+
+    upstream.close.assert_called_once()
+
+
+def test_generic_stream_closes_upstream_when_safety_check_rejects(app, monkeypatch):
+    """The 403 path returns a tuple, not a Response, so nothing else closes it"""
+    monkeypatch.setattr(app_module, "ENABLE_STREAMING_SAFETY_CHECK", True)
+
+    upstream = upstream_with({"Content-Type": "audio/mpeg"})
+    upstream.iter_content.return_value = iter([b"<html>not audio at all</html>"])
+
+    with app.test_request_context():
+        with patch("app.stream.routes.safe_get", return_value=upstream):
+            body, status = generic_stream("https://cdn.example.com/ep1.mp3")
+
+    assert status == 403
+    upstream.close.assert_called_once()

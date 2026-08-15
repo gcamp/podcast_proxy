@@ -33,16 +33,18 @@ def create_proxied_stream_url(original_url: str) -> str:
 def fetch_rss_feed(feed_url: str) -> str | None:
     """Get RSS feed XML"""
     try:
-        response = safe_get(app.session, feed_url, stream=True)
-        response.raise_for_status()
+        # closing the response releases the connection on the oversized-body and
+        # bad-MIME paths too, not just the happy one
+        with safe_get(app.session, feed_url, stream=True) as response:
+            response.raise_for_status()
 
-        content = read_capped(response, MAX_FEED_BYTES)
+            content = read_capped(response, MAX_FEED_BYTES)
 
-        rss_mime_types = {"application/xml", "application/rss+xml", "text/xml"}
-        check_file_mime(content, rss_mime_types)
+            rss_mime_types = {"application/xml", "application/rss+xml", "text/xml"}
+            check_file_mime(content, rss_mime_types)
 
-        # XML defaults to UTF-8 when the response declares no charset
-        return content.decode(response.encoding or "utf-8", errors="replace")
+            # XML defaults to UTF-8 when the response declares no charset
+            return content.decode(response.encoding or "utf-8", errors="replace")
     except requests.RequestException as e:
         logging.error(f"Error fetching feed: {e}")
         return None

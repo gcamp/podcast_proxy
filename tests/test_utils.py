@@ -3,6 +3,7 @@ import socket
 from unittest.mock import Mock
 import pytest
 from app.utils import (
+    DEFAULT_TIMEOUT,
     check_hostname,
     check_file_mime,
     filter_headers,
@@ -263,3 +264,35 @@ def test_safe_get_passes_through_kwargs(stub_dns):
     assert kwargs["stream"] is True
     assert kwargs["headers"] == {"A": "b"}
     assert kwargs["allow_redirects"] is False
+
+
+def test_safe_get_applies_a_default_timeout(stub_dns):
+    """Without this the worker thread blocks forever on a stalled upstream"""
+    session = session_returning(final_response())
+
+    safe_get(session, "https://cdn.example.com/ep1.mp3")
+
+    _, kwargs = session.get.call_args
+    assert kwargs["timeout"] == DEFAULT_TIMEOUT
+
+
+def test_safe_get_timeout_applies_to_every_redirect_hop(stub_dns):
+    """A redirect chain must not be a way to get an untimed request"""
+    session = session_returning(
+        redirect_to("https://cdn.example.com/ep1.mp3"), final_response()
+    )
+
+    safe_get(session, "https://tracking.example.com/ep1.mp3")
+
+    assert all(
+        call.kwargs["timeout"] == DEFAULT_TIMEOUT
+        for call in session.get.call_args_list
+    )
+
+
+def test_safe_get_lets_the_caller_override_the_timeout(stub_dns):
+    session = session_returning(final_response())
+
+    safe_get(session, "https://cdn.example.com/ep1.mp3", timeout=(1, 2))
+
+    assert session.get.call_args.kwargs["timeout"] == (1, 2)
