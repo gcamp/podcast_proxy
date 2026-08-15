@@ -1,18 +1,42 @@
 import logging
 import os
 import requests
+from http import cookiejar
 from flask import Flask
+from werkzeug.middleware.proxy_fix import ProxyFix
 
-EXTERNAL_PROXY = os.getenv("EXTERNAL_PROXY")
-ENABLE_STREAMING_SAFETY_CHECK = (
+EXTERNAL_PROXY: str | None = os.getenv("EXTERNAL_PROXY")
+ENABLE_STREAMING_SAFETY_CHECK: bool = (
     os.getenv("ENABLE_STREAMING_SAFETY_CHECK", "false").lower() == "true"
 )
 
-session = requests.Session()
+class BlockAllCookies(cookiejar.DefaultCookiePolicy):
+    """Refuse to store or send cookies.
+
+    One Session is shared by every request, so a cookie set by one upstream would
+    otherwise be replayed on another user's request to that same host. Client
+    cookies are already stripped by filter_headers, so nothing here relies on them.
+    """
+
+    def set_ok(self, cookie, request) -> bool:
+        return False
+
+    def return_ok(self, cookie, request) -> bool:
+        return False
 
 
-def create_app():
+session: requests.Session = requests.Session()
+session.cookies.set_policy(BlockAllCookies())
+
+
+def create_app() -> Flask:
     app = Flask(__name__)
+
+    # Feeds embed absolute URLs built from request.scheme. A tunnel or reverse
+    # proxy terminates TLS and reaches us over plain HTTP, so without this every
+    # enclosure URL is handed to podcast clients as http://. Only the scheme is
+    # trusted, and only one hop.
+    app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1)  # type: ignore[method-assign]
 
     logging.basicConfig(
         level=logging.INFO, format="[%(asctime)s] [%(levelname)s] %(message)s"

@@ -3,40 +3,48 @@ import requests
 import base64
 import logging
 from datetime import datetime
-from app.utils import check_hostname, check_file_mime
-from flask import Response, url_for, current_app as app, request
+import app
+from app.utils import check_file_mime, read_capped, safe_get
+from flask import Response, url_for, request
 from lxml import etree
 
 from app.feed import bp
 
-XML_NAMESPACES = {
+MAX_FEED_BYTES = 10_000_000  # generous: even long-running shows sit well under this
+
+XML_NAMESPACES: dict[str, str] = {
     "itunes": "http://www.itunes.com/dtds/podcast-1.0.dtd",
     "media": "http://search.yahoo.com/mrss/",
     "atom": "http://www.w3.org/2005/Atom",
 }
 
 
-def create_proxied_stream_url(original_url):
+def create_proxied_stream_url(original_url: str) -> str:
     """Create encoded URL to stream file at a given URL through the proxy server"""
-    encoded_url = base64.urlsafe_b64encode(
-        original_url.encode()
-    ).decode()  # Encode string to file_bytes, b64 encode, then decode b64 file_bytes to string
+    encoded_url = base64.urlsafe_b64encode(original_url.encode()).decode()
     return url_for(
-        "stream.proxy_media", encoded_url=encoded_url, _external=True, _scheme="https"
+        "stream.proxy_media",
+        encoded_url=encoded_url,
+        _external=True,
+        _scheme=request.scheme,
     )
 
 
-def fetch_rss_feed(feed_url):
+def fetch_rss_feed(feed_url: str) -> str | None:
     """Get RSS feed XML"""
     try:
-        check_hostname(feed_url)
-        response = requests.get(feed_url)
-        response.raise_for_status()
+        # closing the response releases the connection on the oversized-body and
+        # bad-MIME paths too, not just the happy one
+        with safe_get(app.session, feed_url, stream=True) as response:
+            response.raise_for_status()
 
-        rss_mime_types = {"application/xml", "application/rss+xml", "text/xml"}
-        check_file_mime(response.content, rss_mime_types)
+            content = read_capped(response, MAX_FEED_BYTES)
 
-        return response.text
+            rss_mime_types = {"application/xml", "application/rss+xml", "text/xml"}
+            check_file_mime(content, rss_mime_types)
+
+            # XML defaults to UTF-8 when the response declares no charset
+            return content.decode(response.encoding or "utf-8", errors="replace")
     except requests.RequestException as e:
         logging.error(f"Error fetching feed: {e}")
         return None
@@ -45,7 +53,7 @@ def fetch_rss_feed(feed_url):
         return None
 
 
-def rewrite_rss_enclosure_urls(feed_content, proxy_feed_url):
+def rewrite_rss_enclosure_urls(feed_content: str, proxy_feed_url: str) -> bytes | None:
     """Rewrite media enclosure URLs and self-referencing elements to proxy through server's address"""
     try:
         root = etree.fromstring(
@@ -71,8 +79,14 @@ def rewrite_rss_enclosure_urls(feed_content, proxy_feed_url):
 
         for item in root.findall("channel/item"):  # items = episodes
             enclosure = item.find("enclosure")
-            proxied_url = create_proxied_stream_url(enclosure.get("url"))
-            enclosure.set("url", proxied_url)
+            if enclosure is None:
+                continue  # e.g. trailer or show-notes items carrying no media
+
+            original_url = enclosure.get("url")
+            if not original_url:
+                continue
+
+            enclosure.set("url", create_proxied_stream_url(original_url))
 
         return etree.tostring(root)
     except Exception as e:
@@ -80,7 +94,7 @@ def rewrite_rss_enclosure_urls(feed_content, proxy_feed_url):
         return None
 
 
-def rewrite_youtube_feed(feed_content):
+def rewrite_youtube_feed(feed_content: str) -> bytes | None:
     """Create an RSS feed from a YouTube channel XML feed"""
     try:
         youtube_channel_feed = etree.fromstring(
@@ -98,11 +112,12 @@ def rewrite_youtube_feed(feed_content):
         ):
             channel.append(convert_yt_entry_to_rss_item(entry))
 
-        latest_thumbnail = channel.find(
-            "item/itunes:image", namespaces=XML_NAMESPACES
-        ).get(
-            "href"
-        )  # use latest video thumbnail as podcast image, otherwise need YT API
+        # use latest video thumbnail as podcast image, otherwise need YT API
+        latest_image = channel.find("item/itunes:image", namespaces=XML_NAMESPACES)
+        latest_thumbnail = (
+            latest_image.get("href") if latest_image is not None else None
+        )  # a channel with no videos yields no thumbnail
+
         convert_yt_channel_to_podcast_channel(
             youtube_channel_feed, channel, image_url=latest_thumbnail
         )
@@ -113,7 +128,9 @@ def rewrite_youtube_feed(feed_content):
         return None
 
 
-def convert_yt_channel_to_podcast_channel(youtube_feed, channel, image_url):
+def convert_yt_channel_to_podcast_channel(
+    youtube_feed: etree._Element, channel: etree._Element, image_url: str | None
+) -> etree._Element:
     """Convert YouTube XML channel metadata into RSS podcast metadata"""
     link = youtube_feed.find(
         'atom:link[@rel="alternate"]', namespaces=XML_NAMESPACES
@@ -127,12 +144,13 @@ def convert_yt_channel_to_podcast_channel(youtube_feed, channel, image_url):
     channel.find("atom:link", namespaces=XML_NAMESPACES).set("href", link)
     channel.find("link").text = link
     channel.find("itunes:author", namespaces=XML_NAMESPACES).text = author
-    channel.find("itunes:image", namespaces=XML_NAMESPACES).set("href", image_url)
+    if image_url is not None:
+        channel.find("itunes:image", namespaces=XML_NAMESPACES).set("href", image_url)
 
     return channel
 
 
-def convert_yt_entry_to_rss_item(entry):
+def convert_yt_entry_to_rss_item(entry: etree._Element) -> etree._Element:
     """Convert a YouTube XML feed <entry> into an RSS <item>"""
     item = etree.Element("item")  # new item to populate
 
@@ -147,7 +165,7 @@ def convert_yt_entry_to_rss_item(entry):
     pub_date = entry.findtext("atom:published", namespaces=XML_NAMESPACES)
     pub_date = datetime.fromisoformat(pub_date).strftime("%a, %d %b %Y %H:%M:%S +0000")
 
-    def create_etree_element(element_name, element_text):
+    def create_etree_element(element_name: str, element_text: str) -> etree._Element:
         element = etree.Element(element_name)
         element.text = element_text
         return element
@@ -181,7 +199,7 @@ def convert_yt_entry_to_rss_item(entry):
 
 
 @bp.route("/<path:feed_path>")
-def proxy_feed(feed_path):
+def proxy_feed(feed_path: str) -> Response | tuple[str, int]:
     """Create a proxied RSS feed for a podcast or YouTube channel"""
     youtube = feed_path.startswith("youtube/")
     if youtube:
