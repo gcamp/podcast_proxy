@@ -216,3 +216,37 @@ def test_proxy_feed_youtube_path_builds_channel_feed_url(client):
                 'https://www.youtube.com/feeds/videos.xml?channel_id=UC123abc'
             )
             mock_rewrite.assert_called_once_with('yt feed content')
+
+SIMPLE_RSS = '''<?xml version="1.0"?>
+<rss version="2.0" xmlns:atom="http://www.w3.org/2005/Atom">
+  <channel>
+    <title>Show</title>
+    <link>https://example.com</link>
+    <item>
+      <title>Ep 1</title>
+      <enclosure url="https://cdn.example.com/ep1.mp3" length="1" type="audio/mpeg"/>
+    </item>
+  </channel>
+</rss>'''
+
+
+def enclosure_url_for(client, headers):
+    with patch('app.feed.routes.fetch_rss_feed', return_value=SIMPLE_RSS):
+        response = client.get(
+            '/feed/example.com/rss', base_url='http://podcasts.gcamp.me', headers=headers
+        )
+    return etree.fromstring(response.data).find('channel/item/enclosure').get('url')
+
+
+def test_enclosure_urls_are_https_behind_a_tls_terminating_proxy(client):
+    """The tunnel reaches us over plain HTTP, but clients must get https:// links"""
+    url = enclosure_url_for(client, {'X-Forwarded-Proto': 'https'})
+
+    assert url.startswith('https://podcasts.gcamp.me/stream/')
+
+
+def test_enclosure_urls_keep_http_when_no_proxy_is_in_front(client):
+    """Local development over plain HTTP must not be rewritten to https"""
+    url = enclosure_url_for(client, {})
+
+    assert url.startswith('http://podcasts.gcamp.me/stream/')

@@ -3,6 +3,7 @@ import os
 import requests
 from http import cookiejar
 from flask import Flask
+from werkzeug.middleware.proxy_fix import ProxyFix
 
 EXTERNAL_PROXY: str | None = os.getenv("EXTERNAL_PROXY")
 ENABLE_STREAMING_SAFETY_CHECK: bool = (
@@ -30,6 +31,12 @@ session.cookies.set_policy(BlockAllCookies())
 
 def create_app() -> Flask:
     app = Flask(__name__)
+
+    # Feeds embed absolute URLs built from request.scheme. A tunnel or reverse
+    # proxy terminates TLS and reaches us over plain HTTP, so without this every
+    # enclosure URL is handed to podcast clients as http://. Only the scheme is
+    # trusted, and only one hop.
+    app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1)  # type: ignore[method-assign]
 
     logging.basicConfig(
         level=logging.INFO, format="[%(asctime)s] [%(levelname)s] %(message)s"
